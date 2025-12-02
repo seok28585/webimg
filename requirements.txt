@@ -1,0 +1,6 @@
+streamlit
+rembg
+pillow
+beautifulsoup4
+requests
+watchdog
