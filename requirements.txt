@@ -1,6 +1,8 @@
 streamlit
 rembg
+onnxruntime
 pillow
 beautifulsoup4
 requests
 watchdog
+numpy<2.0.0
