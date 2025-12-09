@@ -174,7 +174,7 @@ with st.container():
     c1, c2 = st.columns([0.8, 0.2])
     with c1:
         st.title("🎨(주)가울 Image Master Pro")
-        st.markdown("<p style='color:#64748b; font-size:16px;'>디자이너를 위한 올인원 이미지 처리 도구</p>", unsafe_allow_html=True)
+        st.markdown("<p style='color:#64748b; font-size:16px;'>상품등록을 위한 이미지 처리 도구</p>", unsafe_allow_html=True)
     with c2:
         st.write("") # 여백용
 
@@ -330,4 +330,5 @@ with tab3:
                         st.error(f"오류: {e}")
             else:
                 st.markdown("<div style='text-align:center; color:#94a3b8; padding:60px;'><h3>🎨</h3><p>이미지를 업로드하면<br>배경 제거 후 배너를 생성합니다.</p></div>", unsafe_allow_html=True)
+
 
