@@ -4,9 +4,13 @@ from rembg import remove
 import io
 import requests
 from bs4 import BeautifulSoup
+import sys
+
+# [수정 1] 대용량 이미지 처리 시 발생하는 경고/에러 방지 (DecompressionBombError 해제)
+Image.MAX_IMAGE_PIXELS = None
 
 # ==========================================
-# 1. 페이지 설정 및 디자인 (CSS) - UI 대폭 개선
+# 1. 페이지 설정 및 디자인 (CSS)
 # ==========================================
 st.set_page_config(
     page_title="Image Master Pro",
@@ -18,56 +22,36 @@ st.set_page_config(
 # 커스텀 CSS 주입
 st.markdown("""
 <style>
-    /* 전체 배경색: 연한 그레이톤으로 변경하여 눈의 피로 감소 */
-    .stApp {
-        background-color: #f1f5f9;
-    }
+    .stApp { background-color: #f1f5f9; }
     
-    /* ----------------------------------------------------
-       [핵심 개선] 탭(Tab) UI 스타일링 - 직관적인 카드형 버튼
-       ---------------------------------------------------- */
-    
-    /* 탭 컨테이너: 간격을 넓게 벌림 */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 20px;
-        padding: 10px 0 20px 0;
-    }
-
-    /* 개별 탭 버튼 (기본 상태) */
+    /* 탭 스타일링 */
+    .stTabs [data-baseweb="tab-list"] { gap: 20px; padding: 10px 0 20px 0; }
     .stTabs [data-baseweb="tab"] {
-        height: 65px;               /* 높이 확대 */
+        height: 65px;
         white-space: pre-wrap;
-        background-color: #ffffff;  /* 카드 배경 */
-        border-radius: 12px;        /* 둥근 모서리 */
-        color: #64748b;             /* 기본 텍스트 색상 */
-        font-weight: 700;           /* 굵은 폰트 */
-        font-size: 1.1rem;          /* 폰트 크기 확대 */
-        border: 1px solid #e2e8f0;  /* 얇은 테두리 */
+        background-color: #ffffff;
+        border-radius: 12px;
+        color: #64748b;
+        font-weight: 700;
+        font-size: 1.1rem;
+        border: 1px solid #e2e8f0;
         box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
-        flex-grow: 1;               /* 가로 폭을 꽉 채움 (Spacious) */
-        transition: all 0.2s ease;  /* 부드러운 전환 효과 */
+        flex-grow: 1;
+        transition: all 0.2s ease;
     }
-
-    /* 탭에 마우스 올렸을 때 */
     .stTabs [data-baseweb="tab"]:hover {
         transform: translateY(-2px);
         color: #3b82f6;
         border-color: #3b82f6;
     }
-
-    /* 선택된 탭 (Active 상태) - 확실한 강조 */
     .stTabs [aria-selected="true"] {
-        background-color: #3b82f6 !important;  /* 진한 파란색 배경 */
-        color: #ffffff !important;             /* 흰색 텍스트 */
+        background-color: #3b82f6 !important;
+        color: #ffffff !important;
         border: none;
         box-shadow: 0 10px 15px -3px rgba(59, 130, 246, 0.3);
     }
 
-    /* ----------------------------------------------------
-       컨텐츠 영역 스타일링 (Card UI)
-       ---------------------------------------------------- */
-    
-    /* 각 섹션을 흰색 카드로 감싸기 */
+    /* 컨텐츠 영역 스타일링 */
     [data-testid="stVerticalBlock"] > [style*="flex-direction: column;"] > [data-testid="stVerticalBlock"] {
         background-color: #ffffff;
         padding: 25px;
@@ -76,7 +60,7 @@ st.markdown("""
         border: 1px solid #e2e8f0;
     }
     
-    /* 버튼 스타일 통일 */
+    /* 버튼 및 업로더 스타일 */
     .stButton>button {
         border-radius: 10px;
         height: 55px;
@@ -90,18 +74,13 @@ st.markdown("""
         transform: translateY(-2px);
         box-shadow: 0 6px 12px rgba(0,0,0,0.15);
     }
-
-    /* 파일 업로더 디자인 */
     [data-testid='stFileUploader'] section {
         background-color: #f8fafc;
         border: 2px dashed #cbd5e1;
         border-radius: 12px;
         padding: 30px;
     }
-    
-    /* 타이틀 폰트 */
     h1, h2, h3 { font-family: 'Pretendard', sans-serif; color: #1e293b; }
-    
 </style>
 """, unsafe_allow_html=True)
 
@@ -122,6 +101,10 @@ def merge_images_logic(images, direction, width_opt, height_opt):
     
     processed_images = []
     for img in images:
+        # RGBA 이미지가 섞여 있을 경우를 대비해 RGB 캔버스에 붙일 준비
+        if img.mode != 'RGB' and img.mode != 'RGBA':
+            img = img.convert('RGB')
+            
         target_w, target_h = img.size
         
         # 리사이징 로직
@@ -149,6 +132,7 @@ def merge_images_logic(images, direction, width_opt, height_opt):
         total_w = sum(img.width for img in processed_images)
         total_h = max(img.height for img in processed_images)
 
+    # [중요] 캔버스는 RGB 모드로 생성
     new_im = Image.new('RGB', (total_w, total_h), (255, 255, 255))
     
     # 이미지 붙여넣기
@@ -162,8 +146,49 @@ def merge_images_logic(images, direction, width_opt, height_opt):
             x_pos = current_x
             y_pos = (total_h - img.height) // 2
             current_x += img.width
-        new_im.paste(img, (x_pos, y_pos))
+            
+        # 투명 배경(RGBA) 이미지가 있을 경우 처리
+        if img.mode == 'RGBA':
+            new_im.paste(img, (x_pos, y_pos), img)
+        else:
+            new_im.paste(img, (x_pos, y_pos))
+            
     return new_im
+
+# [수정 2] 이미지를 안전하게 표시하고 다운로드 버튼을 제공하는 헬퍼 함수
+def display_and_download(image_obj, file_name_prefix="merged"):
+    # 이미지 크기 확인 (JPEG 한계: 65535 px)
+    is_too_large_for_jpeg = image_obj.height > 65000 or image_obj.width > 65000
+    
+    buf = io.BytesIO()
+    
+    if is_too_large_for_jpeg:
+        # 65000px 초과 시 PNG 사용 (JPEG 저장 불가)
+        save_format = "PNG"
+        mime_type = "image/png"
+        ext = "png"
+        st.warning(f"⚠️ 이미지가 너무 커서({image_obj.height}px) PNG 포맷으로 변환되었습니다. 용량이 클 수 있습니다.")
+    else:
+        # 일반적인 경우 JPEG 사용 (용량 최적화)
+        save_format = "JPEG"
+        mime_type = "image/jpeg"
+        ext = "jpg"
+    
+    # 메모리 버퍼에 저장
+    image_obj.save(buf, format=save_format, quality=100)
+    byte_data = buf.getvalue()
+    
+    # st.image에 PIL 객체 대신 바이트 데이터 전달 (Streamlit 재인코딩 에러 방지)
+    st.image(byte_data, caption=f"결과: {image_obj.width}x{image_obj.height}px", use_container_width=True)
+    
+    # 다운로드 버튼
+    st.download_button(
+        label=f"💾 결과 저장 ({save_format})", 
+        data=byte_data, 
+        file_name=f"{file_name_prefix}.{ext}", 
+        mime=mime_type, 
+        type="secondary"
+    )
 
 # ==========================================
 # 3. 메인 UI 구조
@@ -176,9 +201,9 @@ with st.container():
         st.title("🎨(주)가울 Image Master Pro")
         st.markdown("<p style='color:#64748b; font-size:16px;'>상품등록을 위한 이미지 처리 도구</p>", unsafe_allow_html=True)
     with c2:
-        st.write("") # 여백용
+        st.write("") 
 
-st.write("") # 간격
+st.write("") 
 
 # 메인 탭 메뉴
 tab1, tab2, tab3 = st.tabs(["📁 파일 병합", "🔗 HTML 추출 병합", "✨ AI 배너 제작"])
@@ -191,7 +216,6 @@ with tab1:
     
     with col_left:
         st.subheader("1️⃣ 설정 (Settings)")
-        # 카드형 컨테이너 자동 적용됨 (CSS)
         with st.container():
             st.info("💡 여러 장의 이미지를 드래그해서 한 번에 업로드하세요.")
             files = st.file_uploader("이미지 업로드", accept_multiple_files=True, type=['png', 'jpg', 'jpeg'], label_visibility="collapsed")
@@ -219,11 +243,8 @@ with tab1:
                 result_img = merge_images_logic(images, direction_f, w_f, h_f)
                 
                 if result_img:
-                    st.image(result_img, caption=f"결과: {result_img.width}x{result_img.height}px", use_container_width=True)
-                    
-                    buf = io.BytesIO()
-                    result_img.save(buf, format="JPEG", quality=100)
-                    st.download_button("💾 결과 저장 (JPG)", data=buf.getvalue(), file_name="merged.jpg", mime="image/jpeg", type="secondary")
+                    # [수정 3] 에러 방지 헬퍼 함수 사용
+                    display_and_download(result_img, "merged_file")
             else:
                 st.markdown("<div style='text-align:center; color:#94a3b8; padding:60px;'><h3>🖼️</h3><p>이미지가 여기에 표시됩니다.</p></div>", unsafe_allow_html=True)
 
@@ -262,11 +283,9 @@ with tab2:
                         imgs = [img for url in src_list if (img := download_image_from_url(url))]
                         if imgs:
                             res_h = merge_images_logic(imgs, direction_h, w_h, h_h)
-                            st.image(res_h, caption=f"병합 완료 ({len(imgs)}장)", use_container_width=True)
                             
-                            buf = io.BytesIO()
-                            res_h.save(buf, format="JPEG", quality=100)
-                            st.download_button("💾 결과 저장 (JPG)", data=buf.getvalue(), file_name="html_merged.jpg", mime="image/jpeg", type="secondary")
+                            # [수정 4] 에러 방지 헬퍼 함수 사용
+                            display_and_download(res_h, "merged_html")
                         else:
                             st.error("이미지를 다운로드할 수 없습니다.")
                     else:
@@ -321,14 +340,10 @@ with tab3:
                         canvas.paste(resized_img, (pos_x, pos_y), resized_img)
                         final_rgb = canvas.convert("RGB")
                         
-                        st.image(final_rgb, caption="AI 생성 배너", use_container_width=True)
+                        # [수정 5] 에러 방지 헬퍼 함수 사용
+                        display_and_download(final_rgb, "ai_banner")
                         
-                        buf = io.BytesIO()
-                        final_rgb.save(buf, format="JPEG", quality=100)
-                        st.download_button("💾 배너 다운로드", data=buf.getvalue(), file_name="ai_banner.jpg", mime="image/jpeg", type="primary")
                     except Exception as e:
                         st.error(f"오류: {e}")
             else:
                 st.markdown("<div style='text-align:center; color:#94a3b8; padding:60px;'><h3>🎨</h3><p>이미지를 업로드하면<br>배경 제거 후 배너를 생성합니다.</p></div>", unsafe_allow_html=True)
-
-
