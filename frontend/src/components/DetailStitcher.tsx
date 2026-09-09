@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   Upload,
   Layers,
@@ -13,10 +13,17 @@ import {
   ZoomOut,
   RotateCcw,
   CheckCircle2,
-  Info
+  Info,
+  Loader2,
 } from 'lucide-react';
 import type { UploadedImage, StitchSettings, MergeDirection } from '../types';
-import { getImageDimensions, stitchImages, sliceAndZipImages, formatBytes } from '../utils/imageUtils';
+import {
+  getImageDimensions,
+  stitchImages,
+  sliceAndZipImages,
+  formatBytes,
+  type StitchResult,
+} from '../utils/imageUtils';
 
 interface DetailStitcherProps {
   onNotify: (msg: string) => void;
@@ -26,6 +33,14 @@ interface DetailStitcherProps {
 export const DetailStitcher: React.FC<DetailStitcherProps> = ({ onNotify, externalImages }) => {
   const [images, setImages] = useState<UploadedImage[]>(externalImages || []);
   const [draggedIdx, setDraggedIdx] = useState<number | null>(null);
+
+  // External images sync
+  useEffect(() => {
+    if (externalImages && externalImages.length > 0) {
+      setImages(externalImages);
+      setStitchResult(null);
+    }
+  }, [externalImages]);
 
   // Settings
   const [direction, setDirection] = useState<MergeDirection>('vertical');
@@ -39,10 +54,7 @@ export const DetailStitcher: React.FC<DetailStitcherProps> = ({ onNotify, extern
 
   // Result state
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
-  const [resultCanvas, setResultCanvas] = useState<HTMLCanvasElement | null>(null);
-  const [resultBlob, setResultBlob] = useState<Blob | null>(null);
-  const [resultUrl, setResultUrl] = useState<string | null>(null);
-  const [resultDimensions, setResultDimensions] = useState<{ width: number; height: number } | null>(null);
+  const [stitchResult, setStitchResult] = useState<StitchResult | null>(null);
 
   // Preview zoom
   const [zoomLevel, setZoomLevel] = useState<number>(1);
@@ -72,6 +84,7 @@ export const DetailStitcher: React.FC<DetailStitcherProps> = ({ onNotify, extern
     }
 
     setImages((prev) => [...prev, ...newItems]);
+    setStitchResult(null);
     onNotify(`${newItems.length}개의 이미지가 추가되었습니다.`);
   };
 
@@ -82,6 +95,7 @@ export const DetailStitcher: React.FC<DetailStitcherProps> = ({ onNotify, extern
 
   const removeImage = (index: number) => {
     setImages((prev) => prev.filter((_, i) => i !== index));
+    setStitchResult(null);
   };
 
   const moveImage = (from: number, to: number) => {
@@ -92,6 +106,7 @@ export const DetailStitcher: React.FC<DetailStitcherProps> = ({ onNotify, extern
       next.splice(to, 0, moved);
       return next;
     });
+    setStitchResult(null);
   };
 
   // Drag & drop reorder
@@ -128,14 +143,16 @@ export const DetailStitcher: React.FC<DetailStitcherProps> = ({ onNotify, extern
       };
 
       const res = await stitchImages(images, settings);
-      setResultCanvas(res.canvas);
-      setResultBlob(res.blob);
-      if (resultUrl) URL.revokeObjectURL(resultUrl);
-      const url = URL.createObjectURL(res.blob);
-      setResultUrl(url);
-      setResultDimensions({ width: res.totalWidth, height: res.totalHeight });
+      setStitchResult(res);
       setZoomLevel(1);
-      onNotify('이미지 병합이 완료되었습니다!');
+
+      if (res.isOverLimit) {
+        onNotify(
+          `전체 높이가 ${res.totalHeight.toLocaleString()}px로 커서 쇼핑몰 규격에 맞춰 ${res.slices.length}개 조각으로 안전 분할되었습니다!`
+        );
+      } else {
+        onNotify('이미지 병합이 완료되었습니다!');
+      }
     } catch (err: any) {
       alert(`병합 중 오류가 발생했습니다: ${err.message}`);
     } finally {
@@ -144,34 +161,51 @@ export const DetailStitcher: React.FC<DetailStitcherProps> = ({ onNotify, extern
   };
 
   // Download single image
-  const handleDownloadSingle = () => {
-    if (!resultBlob || !resultUrl) return;
+  const handleDownloadSingle = async () => {
+    if (!stitchResult) return;
     const ext = format === 'image/webp' ? 'webp' : format === 'image/png' ? 'png' : 'jpg';
-    const a = document.createElement('a');
-    a.href = resultUrl;
-    a.download = `gaul_detail_${Date.now()}.${ext}`;
-    a.click();
+
+    if (stitchResult.blob) {
+      const a = document.createElement('a');
+      const url = URL.createObjectURL(stitchResult.blob);
+      a.href = url;
+      a.download = `gaul_detail_${Date.now()}.${ext}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } else {
+      // 30,000px를 초과하여 브라우저/쇼핑몰 한계로 분할 ZIP으로 다운로드
+      alert(
+        `전체 세로 길이(${stitchResult.totalHeight.toLocaleString()}px)가 웹 브라우저 단일 그래픽스 한계(32,767px) 및 네이버/쿠팡 업로드 규격(최대 20,000px)을 초과합니다.\n\n안전하게 분할된 ZIP 압축 파일(${stitchResult.slices.length}조각)로 다운로드됩니다.`
+      );
+      await handleDownloadSlicedZip();
+    }
   };
 
   // Download sliced ZIP
   const handleDownloadSlicedZip = async () => {
-    if (!resultCanvas) return;
+    if (!stitchResult || stitchResult.slices.length === 0) return;
     setIsProcessing(true);
     try {
-      const zipBlob = await sliceAndZipImages(resultCanvas, sliceHeight, format, quality);
+      const zipBlob = await sliceAndZipImages(stitchResult.slices, format, 'gaul_detail_slice');
       const url = URL.createObjectURL(zipBlob);
       const a = document.createElement('a');
       a.href = url;
       a.download = `gaul_detail_slices_${Date.now()}.zip`;
       a.click();
       URL.revokeObjectURL(url);
-      onNotify('슬라이스 분할 압축파일(ZIP)이 다운로드되었습니다.');
+      onNotify(`슬라이스 분할 압축파일(ZIP, ${stitchResult.slices.length}조각)이 다운로드되었습니다.`);
     } catch (err: any) {
       alert(`슬라이스 다운로드 실패: ${err.message}`);
     } finally {
       setIsProcessing(false);
     }
   };
+
+  const totalCalculatedHeight = images.reduce((acc, img) => {
+    const targetW = presetWidth > 0 ? presetWidth : customWidth;
+    const ratio = targetW > 0 ? targetW / img.width : 1;
+    return acc + Math.round(img.height * ratio);
+  }, 0);
 
   return (
     <div className="panel-grid">
@@ -182,87 +216,123 @@ export const DetailStitcher: React.FC<DetailStitcherProps> = ({ onNotify, extern
             <Layers className="text-primary" size={20} />
             상세페이지 병합 설정
           </h2>
-          {images.length > 0 && (
-            <button
-              className="btn btn-sm btn-danger"
-              onClick={() => setImages([])}
-              title="전체 비우기"
-              id="btn-clear-stitch-images"
-            >
-              <Trash2 size={14} /> 전체 비우기
-            </button>
-          )}
+          <span className="card-badge">{images.length}장 등록됨</span>
         </div>
 
-        {/* Upload Dropzone */}
+        {/* File Upload Zone */}
         <div
-          className="dropzone"
+          className="drop-zone"
           onDragOver={(e) => e.preventDefault()}
           onDrop={handleDrop}
           onClick={() => fileInputRef.current?.click()}
-          id="dropzone-stitch"
         >
           <input
             type="file"
-            ref={fileInputRef}
             multiple
-            accept="image/png, image/jpeg, image/webp"
+            accept="image/*"
+            ref={fileInputRef}
             style={{ display: 'none' }}
             onChange={(e) => handleFiles(e.target.files)}
           />
-          <div className="dropzone-icon">
-            <Upload size={24} />
+          <div className="drop-zone-icon">
+            <Upload size={36} color="var(--primary)" />
           </div>
-          <h3>상세페이지 이미지 업로드</h3>
-          <p>클릭하거나 이미지를 끌어다 놓으세요 (순서대로 병합됩니다)</p>
+          <div className="drop-zone-title">이미지를 드래그하거나 클릭하여 추가</div>
+          <div className="drop-zone-desc">JPG, PNG, WebP 등 여러 장을 한 번에 올릴 수 있습니다.</div>
         </div>
 
-        {/* Image List with Drag Reordering */}
+        {/* Image Order List */}
         {images.length > 0 && (
-          <div className="form-group" style={{ marginTop: '1.25rem' }}>
+          <div style={{ marginTop: '1.25rem' }}>
             <label className="form-label" style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span>업로드된 이미지 ({images.length}장) - 드래그하여 순서 변경</span>
+              <span>병합 순서 조정 (드래그하여 순서 변경)</span>
+              <button
+                className="btn btn-sm btn-danger"
+                style={{ padding: '2px 8px', fontSize: '0.75rem' }}
+                onClick={() => setImages([])}
+              >
+                전체 삭제
+              </button>
             </label>
-            <div className="thumb-list">
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '8px',
+                maxHeight: '260px',
+                overflowY: 'auto',
+                paddingRight: '4px',
+              }}
+            >
               {images.map((img, idx) => (
                 <div
                   key={img.id}
-                  className={`thumb-item ${draggedIdx === idx ? 'dragging' : ''}`}
                   draggable
                   onDragStart={() => handleDragStart(idx)}
                   onDragOver={(e) => handleDragOver(e, idx)}
                   onDragEnd={handleDragEnd}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '10px',
+                    padding: '8px 12px',
+                    borderRadius: 'var(--radius-md)',
+                    background: draggedIdx === idx ? 'var(--primary-light)' : 'var(--bg-subtle)',
+                    border: '1px solid var(--border-light)',
+                    cursor: 'grab',
+                    transition: 'all 0.15s ease',
+                  }}
                 >
-                  <img src={img.previewUrl} alt={img.name} className="thumb-preview-img" />
-                  <div className="thumb-meta">
-                    <div className="thumb-name">{img.name}</div>
-                    <div className="thumb-dimensions">
-                      {img.width} × {img.height}px
+                  <img
+                    src={img.previewUrl}
+                    alt={img.name}
+                    style={{
+                      width: '40px',
+                      height: '40px',
+                      objectFit: 'cover',
+                      borderRadius: '4px',
+                    }}
+                  />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div
+                      style={{
+                        fontSize: '0.85rem',
+                        fontWeight: 600,
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                      }}
+                    >
+                      {img.name}
+                    </div>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                      {img.width} × {img.height.toLocaleString()}px
                     </div>
                   </div>
+
                   <div style={{ display: 'flex', gap: '4px' }}>
                     <button
                       className="btn btn-sm btn-secondary"
+                      style={{ padding: '4px' }}
                       onClick={() => moveImage(idx, idx - 1)}
                       disabled={idx === 0}
-                      title="위로 이동"
                     >
-                      <MoveUp size={12} />
+                      <MoveUp size={14} />
                     </button>
                     <button
                       className="btn btn-sm btn-secondary"
+                      style={{ padding: '4px' }}
                       onClick={() => moveImage(idx, idx + 1)}
                       disabled={idx === images.length - 1}
-                      title="아래로 이동"
                     >
-                      <MoveDown size={12} />
+                      <MoveDown size={14} />
                     </button>
                     <button
                       className="btn btn-sm btn-danger"
+                      style={{ padding: '4px' }}
                       onClick={() => removeImage(idx)}
-                      title="삭제"
                     >
-                      <Trash2 size={12} />
+                      <Trash2 size={14} />
                     </button>
                   </div>
                 </div>
@@ -271,92 +341,85 @@ export const DetailStitcher: React.FC<DetailStitcherProps> = ({ onNotify, extern
           </div>
         )}
 
-        {/* Merge Options */}
-        <div style={{ marginTop: '1.5rem' }}>
+        {/* Stitch Controls */}
+        <div style={{ marginTop: '1.5rem', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+          {/* Direction */}
           <div className="form-group">
             <label className="form-label">병합 방향</label>
-            <div style={{ display: 'flex', gap: '10px' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
               <button
-                type="button"
                 className={`btn ${direction === 'vertical' ? 'btn-primary' : 'btn-secondary'}`}
-                style={{ flex: 1 }}
                 onClick={() => setDirection('vertical')}
-                id="btn-dir-vertical"
               >
                 <ArrowDown size={16} /> 세로 병합 (↓)
               </button>
               <button
-                type="button"
                 className={`btn ${direction === 'horizontal' ? 'btn-primary' : 'btn-secondary'}`}
-                style={{ flex: 1 }}
                 onClick={() => setDirection('horizontal')}
-                id="btn-dir-horizontal"
               >
                 <ArrowRight size={16} /> 가로 병합 (→)
               </button>
             </div>
           </div>
 
-          {/* Market Width Presets */}
+          {/* Width Preset */}
           <div className="form-group">
             <label className="form-label">쇼핑몰 규격 프리셋 (너비)</label>
-            <div className="preset-grid">
-              <div
-                className={`preset-pill ${presetWidth === 860 ? 'active' : ''}`}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+              <button
+                className={`btn btn-sm ${presetWidth === 860 ? 'btn-primary' : 'btn-secondary'}`}
                 onClick={() => {
                   setPresetWidth(860);
                   setCustomWidth(860);
                 }}
               >
-                <div className="preset-pill-title">네이버 스마트스토어</div>
-                <div className="preset-pill-desc">권장 860px (선명도 최적)</div>
-              </div>
-              <div
-                className={`preset-pill ${presetWidth === 780 ? 'active' : ''}`}
+                네이버 스마트스토어
+                <span style={{ fontSize: '0.7rem', display: 'block', opacity: 0.8 }}>권장 860px (선명도 최적)</span>
+              </button>
+              <button
+                className={`btn btn-sm ${presetWidth === 780 ? 'btn-primary' : 'btn-secondary'}`}
                 onClick={() => {
                   setPresetWidth(780);
                   setCustomWidth(780);
                 }}
               >
-                <div className="preset-pill-title">쿠팡 (Coupang)</div>
-                <div className="preset-pill-desc">권장 780px 맞춤</div>
-              </div>
-              <div
-                className={`preset-pill ${presetWidth === 1000 ? 'active' : ''}`}
+                쿠팡 (Coupang)
+                <span style={{ fontSize: '0.7rem', display: 'block', opacity: 0.8 }}>권장 780px 맞춤</span>
+              </button>
+              <button
+                className={`btn btn-sm ${presetWidth === 1000 ? 'btn-primary' : 'btn-secondary'}`}
                 onClick={() => {
                   setPresetWidth(1000);
                   setCustomWidth(1000);
                 }}
               >
-                <div className="preset-pill-title">오픈마켓 / 자사몰</div>
-                <div className="preset-pill-desc">1000px 고화질</div>
-              </div>
-              <div
-                className={`preset-pill ${presetWidth === 0 ? 'active' : ''}`}
+                오픈마켓 / 자사몰
+                <span style={{ fontSize: '0.7rem', display: 'block', opacity: 0.8 }}>1000px 고화질</span>
+              </button>
+              <button
+                className={`btn btn-sm ${presetWidth === 0 ? 'btn-primary' : 'btn-secondary'}`}
                 onClick={() => setPresetWidth(0)}
               >
-                <div className="preset-pill-title">원본 비율 유지</div>
-                <div className="preset-pill-desc">Auto (리사이즈 없음)</div>
-              </div>
+                원본 비율 유지
+                <span style={{ fontSize: '0.7rem', display: 'block', opacity: 0.8 }}>Auto (리사이즈 없음)</span>
+              </button>
             </div>
 
             {presetWidth !== 0 && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>직접 너비 입력:</span>
+              <div style={{ marginTop: '8px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>직접 너비 입력:</span>
                 <input
                   type="number"
                   className="form-input"
                   style={{ width: '120px' }}
                   value={customWidth}
                   onChange={(e) => {
-                    const v = Number(e.target.value);
-                    setCustomWidth(v);
-                    setPresetWidth(v);
+                    const val = Number(e.target.value);
+                    setCustomWidth(val);
+                    setPresetWidth(val);
                   }}
-                  step={10}
-                  min={100}
                 />
-                <span style={{ fontSize: '0.85rem' }}>px</span>
+                <span style={{ fontSize: '0.8rem' }}>px</span>
               </div>
             )}
           </div>
@@ -414,18 +477,20 @@ export const DetailStitcher: React.FC<DetailStitcherProps> = ({ onNotify, extern
                 onChange={(e) => setSliceHeight(Number(e.target.value))}
               >
                 <option value={0}>❌ 분할 안 함 (통으로만 다운로드)</option>
-                <option value={10000}>10,000px 단위 분할 (쇼핑몰 표준)</option>
+                <option value={10000}>10,000px 단위 분할 (쇼핑몰 권장)</option>
                 <option value={8000}>8,000px 단위 분할</option>
                 <option value={5000}>5,000px 단위 분할 (모바일 최적화)</option>
-                <option value={20000}>20,000px 단위 분할</option>
+                <option value={20000}>20,000px 단위 분할 (쇼핑몰 상한)</option>
               </select>
             </div>
           </div>
 
+          {/* Quality */}
           {format !== 'image/png' && (
             <div className="form-group">
               <label className="form-label" style={{ display: 'flex', justifyContent: 'space-between' }}>
                 <span>압축 품질 ({Math.round(quality * 100)}%)</span>
+                <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>기본 92% 권장</span>
               </label>
               <input
                 type="range"
@@ -439,13 +504,39 @@ export const DetailStitcher: React.FC<DetailStitcherProps> = ({ onNotify, extern
             </div>
           )}
 
+          {/* Total Height Warning if huge */}
+          {totalCalculatedHeight > 30000 && sliceHeight === 0 && (
+            <div
+              style={{
+                padding: '8px 12px',
+                borderRadius: 'var(--radius-md)',
+                background: 'hsla(38, 92%, 50%, 0.1)',
+                color: 'var(--warning)',
+                fontSize: '0.8rem',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+              }}
+            >
+              <Info size={16} />
+              예상 높이({totalCalculatedHeight.toLocaleString()}px)가 브라우저 단일 한계를 초과하여 안전 자동 분할 처리됩니다.
+            </div>
+          )}
+
           <button
             className="btn btn-primary btn-lg"
             onClick={handleStitch}
             disabled={images.length === 0 || isProcessing}
             id="btn-run-stitch"
           >
-            {isProcessing ? '초고속 병합 처리 중...' : `🚀 이미지 ${images.length}장 병합 실행`}
+            {isProcessing ? (
+              <>
+                <Loader2 size={18} className="animate-spin" />
+                초고속 병합 처리 중...
+              </>
+            ) : (
+              `🚀 이미지 ${images.length}장 병합 실행`
+            )}
           </button>
         </div>
       </div>
@@ -457,23 +548,21 @@ export const DetailStitcher: React.FC<DetailStitcherProps> = ({ onNotify, extern
             <CheckCircle2 className="text-primary" size={20} />
             병합 결과 및 미리보기
           </h2>
-          {resultDimensions && (
+          {stitchResult && (
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
               <span style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--primary)' }}>
-                {resultDimensions.width} × {resultDimensions.height} px
+                {stitchResult.totalWidth} × {stitchResult.totalHeight.toLocaleString()} px
               </span>
-              {resultBlob && (
-                <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                  ({formatBytes(resultBlob.size)})
-                </span>
-              )}
+              <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                ({formatBytes(stitchResult.slices.reduce((acc, s) => acc + s.blob.size, 0))})
+              </span>
             </div>
           )}
         </div>
 
         <div className="preview-container">
           {/* Zoom controls */}
-          {resultUrl && (
+          {stitchResult && (
             <div className="preview-toolbar">
               <button
                 className="btn btn-sm btn-secondary"
@@ -502,19 +591,46 @@ export const DetailStitcher: React.FC<DetailStitcherProps> = ({ onNotify, extern
             </div>
           )}
 
-          {resultUrl ? (
-            <div style={{ overflow: 'auto', maxHeight: '720px', width: '100%', textAlign: 'center' }}>
-              <img
-                src={resultUrl}
-                alt="Merged Result"
+          {stitchResult ? (
+            <div
+              style={{
+                overflow: 'auto',
+                maxHeight: '720px',
+                width: '100%',
+                textAlign: 'center',
+                padding: '8px',
+              }}
+            >
+              <div
                 style={{
+                  display: 'inline-flex',
+                  flexDirection: direction === 'vertical' ? 'column' : 'row',
+                  alignItems: 'center',
+                  justifyContent: 'center',
                   transform: `scale(${zoomLevel})`,
                   transformOrigin: 'top center',
                   transition: 'transform 0.15s ease',
                   boxShadow: 'var(--shadow-xl)',
-                  maxWidth: '100%',
+                  margin: '0 auto',
+                  lineHeight: 0,
+                  fontSize: 0,
                 }}
-              />
+              >
+                {stitchResult.slices.map((slice) => (
+                  <img
+                    key={slice.index}
+                    src={slice.previewUrl}
+                    alt={`Slice ${slice.index + 1}`}
+                    style={{
+                      display: 'block',
+                      maxWidth: '100%',
+                      margin: 0,
+                      padding: 0,
+                      border: 'none',
+                    }}
+                  />
+                ))}
+              </div>
             </div>
           ) : (
             <div className="preview-empty-state">
@@ -526,28 +642,54 @@ export const DetailStitcher: React.FC<DetailStitcherProps> = ({ onNotify, extern
         </div>
 
         {/* Download Action Buttons */}
-        {resultUrl && (
-          <div style={{ marginTop: '1.25rem', display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
-            <button
-              className="btn btn-primary"
-              style={{ flex: 1 }}
-              onClick={handleDownloadSingle}
-              id="btn-download-merged"
-            >
-              <Download size={18} />
-              💾 통으로 다운로드 (통합 단일 이미지 - {format.replace('image/', '').toUpperCase()})
-            </button>
-            {sliceHeight > 0 && resultDimensions && resultDimensions.height > sliceHeight && (
-              <button
-                className="btn btn-secondary"
-                style={{ flex: 1 }}
-                onClick={handleDownloadSlicedZip}
-                id="btn-download-slices-zip"
+        {stitchResult && (
+          <div style={{ marginTop: '1.25rem' }}>
+            {stitchResult.isOverLimit && (
+              <div
+                style={{
+                  marginBottom: '1rem',
+                  padding: '10px 14px',
+                  borderRadius: 'var(--radius-md)',
+                  background: 'hsla(38, 92%, 50%, 0.1)',
+                  color: 'var(--warning)',
+                  fontSize: '0.85rem',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                }}
               >
-                <Archive size={18} />
-                📦 슬라이스 분할 ZIP ({Math.ceil(resultDimensions.height / sliceHeight)}조각)
-              </button>
+                <Info size={16} />
+                전체 높이({stitchResult.totalHeight.toLocaleString()}px)가 브라우저 단일 그래픽스 한계(30,000px) 및 네이버/쿠팡 권장 규격을 초과하여 {stitchResult.slices.length}개 조각으로 안전 분할되었습니다.
+              </div>
             )}
+
+            <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
+              <button
+                className="btn btn-primary"
+                style={{ flex: 1, minWidth: '220px' }}
+                onClick={handleDownloadSingle}
+                disabled={isProcessing}
+                id="btn-download-merged"
+              >
+                <Download size={18} />
+                {stitchResult.blob
+                  ? `💾 통으로 다운로드 (${format.replace('image/', '').toUpperCase()})`
+                  : `📦 분할 ZIP 다운로드 (${stitchResult.slices.length}조각 압축)`}
+              </button>
+
+              {stitchResult.slices.length > 1 && (
+                <button
+                  className="btn btn-secondary"
+                  style={{ flex: 1, minWidth: '220px' }}
+                  onClick={handleDownloadSlicedZip}
+                  disabled={isProcessing}
+                  id="btn-download-slices-zip"
+                >
+                  <Archive size={18} />
+                  📦 슬라이스 분할 ZIP ({stitchResult.slices.length}조각)
+                </button>
+              )}
+            </div>
           </div>
         )}
 
@@ -566,7 +708,7 @@ export const DetailStitcher: React.FC<DetailStitcherProps> = ({ onNotify, extern
         >
           <Info size={20} color="var(--primary)" />
           <div>
-            <strong>통으로 다운받으시려면?</strong> 파란색 <strong>[💾 통으로 다운로드]</strong> 버튼을 누르시면 분할되지 않는 1장의 긴 원본 파일로 즉시 저장됩니다. (쇼핑몰 업로드 용량 제한이 있을 때만 슬라이스 ZIP을 활용하세요)
+            <strong>쇼핑몰 등록 가이드:</strong> 네이버 스마트스토어 및 쿠팡은 상품 상세페이지 1장의 권장 높이가 10,000px~20,000px입니다. 너무 긴 이미지는 로딩 속도 저하를 방지하기 위해 <strong>[슬라이스 분할 ZIP]</strong>을 권장합니다.
           </div>
         </div>
       </div>

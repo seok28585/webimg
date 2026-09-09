@@ -1,12 +1,41 @@
 import JSZip from 'jszip';
 import type { UploadedImage, StitchSettings, ThumbnailSettings } from '../types';
 
+export interface StitchSlice {
+  index: number;
+  canvas: HTMLCanvasElement;
+  blob: Blob;
+  previewUrl: string;
+  width: number;
+  height: number;
+  startY: number;
+}
+
+export interface StitchResult {
+  totalWidth: number;
+  totalHeight: number;
+  isOverLimit: boolean;
+  canvas: HTMLCanvasElement | null;
+  blob: Blob | null;
+  slices: StitchSlice[];
+}
+
 export const loadImage = (src: string): Promise<HTMLImageElement> => {
   return new Promise((resolve, reject) => {
     const img = new Image();
-    img.crossOrigin = 'anonymous';
+    if (!src.startsWith('blob:') && !src.startsWith('data:')) {
+      img.crossOrigin = 'anonymous';
+    }
+    img.referrerPolicy = 'no-referrer';
     img.onload = () => resolve(img);
-    img.onerror = (e) => reject(new Error(`이미지 로드 실패: ${src} (${e})`));
+    img.onerror = () => {
+      // CORS 실패 시 crossOrigin 없이 재시도
+      const fallback = new Image();
+      fallback.referrerPolicy = 'no-referrer';
+      fallback.onload = () => resolve(fallback);
+      fallback.onerror = (e) => reject(new Error(`이미지 로드 실패: ${src} (${e})`));
+      fallback.src = src;
+    };
     img.src = src;
   });
 };
@@ -28,7 +57,7 @@ export const getImageDimensions = (file: File): Promise<{ width: number; height:
 export const stitchImages = async (
   images: UploadedImage[],
   settings: StitchSettings
-): Promise<{ canvas: HTMLCanvasElement; blob: Blob; totalWidth: number; totalHeight: number }> => {
+): Promise<StitchResult> => {
   if (images.length === 0) {
     throw new Error('병합할 이미지가 없습니다.');
   }
@@ -36,7 +65,7 @@ export const stitchImages = async (
   // 1. 모든 이미지 로드
   const loadedImgs = await Promise.all(images.map((img) => loadImage(img.previewUrl)));
 
-  // 2. 리사이즈 및 캔버스 크기 계산
+  // 2. 리사이즈 및 레이아웃 배치 계산
   const targetWidth = settings.presetWidth > 0 ? settings.presetWidth : settings.customWidth;
   const isVertical = settings.direction === 'vertical';
 
@@ -50,7 +79,7 @@ export const stitchImages = async (
     let w = img.naturalWidth;
     let h = img.naturalHeight;
 
-    if (targetWidth > 0) {
+    if (targetWidth > 0 && isVertical) {
       const ratio = targetWidth / w;
       w = targetWidth;
       h = Math.round(h * ratio);
@@ -70,60 +99,218 @@ export const stitchImages = async (
     totalHeight = Math.max(...sizedList.map((s) => s.h));
   }
 
-  // 3. 캔버스에 그리기
-  const canvas = document.createElement('canvas');
-  canvas.width = totalWidth;
-  canvas.height = totalHeight;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) throw new Error('Canvas 2D Context를 생성할 수 없습니다.');
-
-  // 배경색 채우기
-  ctx.fillStyle = settings.backgroundColor || '#ffffff';
-  ctx.fillRect(0, 0, totalWidth, totalHeight);
-
-  // 이미지 드로잉
+  // 배치 좌표 계산
+  interface Placement {
+    img: HTMLImageElement;
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  }
+  const placements: Placement[] = [];
   let curX = 0;
   let curY = 0;
 
   for (const s of sizedList) {
     if (isVertical) {
       const posX = Math.round((totalWidth - s.w) / 2);
-      ctx.drawImage(s.img, posX, curY, s.w, s.h);
+      placements.push({ img: s.img, x: posX, y: curY, w: s.w, h: s.h });
       curY += s.h + gap;
     } else {
       const posY = Math.round((totalHeight - s.h) / 2);
-      ctx.drawImage(s.img, curX, posY, s.w, s.h);
+      placements.push({ img: s.img, x: curX, y: posY, w: s.w, h: s.h });
       curX += s.w + gap;
     }
   }
 
-  const blob = await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob(
-      (b) => {
-        if (b) resolve(b);
-        else reject(new Error('Canvas Blob 생성 실패'));
-      },
-      settings.format,
-      settings.quality
-    );
-  });
+  // 브라우저 캔버스 단일 한계 (Chrome: 65,535px, Firefox/일반 GPU 안전 한계: 30,000px)
+  const MAX_SAFE_CANVAS_DIM = 30000;
+  const shouldChunk = isVertical
+    ? (settings.sliceHeight > 0 || totalHeight > MAX_SAFE_CANVAS_DIM)
+    : (settings.sliceHeight > 0 || totalWidth > MAX_SAFE_CANVAS_DIM);
 
-  return { canvas, blob, totalWidth, totalHeight };
+  const effectiveChunkSize = settings.sliceHeight > 0
+    ? settings.sliceHeight
+    : 15000; // 분할 안 함 선택 시에도 30,000px 초과하면 15,000px 단위 안전 청크로 분할
+
+  const slices: StitchSlice[] = [];
+
+  // 청크 렌더링 함수
+  const renderVerticalSlice = async (startY: number, sliceH: number, index: number): Promise<StitchSlice> => {
+    const sliceCanvas = document.createElement('canvas');
+    sliceCanvas.width = totalWidth;
+    sliceCanvas.height = sliceH;
+    const ctx = sliceCanvas.getContext('2d');
+    if (!ctx) throw new Error('Canvas 2D Context를 생성할 수 없습니다.');
+
+    ctx.fillStyle = settings.backgroundColor || '#ffffff';
+    ctx.fillRect(0, 0, totalWidth, sliceH);
+
+    const endY = startY + sliceH;
+
+    for (const p of placements) {
+      const pEndY = p.y + p.h;
+      if (p.y < endY && pEndY > startY) {
+        const intersectTop = Math.max(p.y, startY);
+        const intersectBottom = Math.min(pEndY, endY);
+        const drawH = intersectBottom - intersectTop;
+
+        const scaleY = p.img.naturalHeight / p.h;
+        const sy = (intersectTop - p.y) * scaleY;
+        const sh = drawH * scaleY;
+        const sx = 0;
+        const sw = p.img.naturalWidth;
+
+        const dx = p.x;
+        const dy = intersectTop - startY;
+        const dw = p.w;
+        const dh = drawH;
+
+        ctx.drawImage(p.img, sx, sy, sw, sh, dx, dy, dw, dh);
+      }
+    }
+
+    const blob = await new Promise<Blob>((resolve, reject) => {
+      sliceCanvas.toBlob(
+        (b) => {
+          if (b) resolve(b);
+          else reject(new Error('슬라이스 캔버스 Blob 생성 실패'));
+        },
+        settings.format,
+        settings.quality
+      );
+    });
+
+    return {
+      index,
+      canvas: sliceCanvas,
+      blob,
+      previewUrl: URL.createObjectURL(blob),
+      width: totalWidth,
+      height: sliceH,
+      startY,
+    };
+  };
+
+  if (isVertical && shouldChunk) {
+    const numSlices = Math.ceil(totalHeight / effectiveChunkSize);
+    for (let i = 0; i < numSlices; i++) {
+      const startY = i * effectiveChunkSize;
+      const sliceH = Math.min(effectiveChunkSize, totalHeight - startY);
+      const s = await renderVerticalSlice(startY, sliceH, i);
+      slices.push(s);
+    }
+
+    return {
+      totalWidth,
+      totalHeight,
+      isOverLimit: totalHeight > MAX_SAFE_CANVAS_DIM,
+      canvas: null,
+      blob: null,
+      slices,
+    };
+  } else {
+    // 30,000px 이하인 경우 단일 캔버스 렌더링 시도
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = totalWidth;
+      canvas.height = totalHeight;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('Canvas 2D Context를 생성할 수 없습니다.');
+
+      ctx.fillStyle = settings.backgroundColor || '#ffffff';
+      ctx.fillRect(0, 0, totalWidth, totalHeight);
+
+      for (const p of placements) {
+        ctx.drawImage(p.img, p.x, p.y, p.w, p.h);
+      }
+
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob(
+          (b) => {
+            if (b) resolve(b);
+            else reject(new Error('Canvas Blob 생성 실패'));
+          },
+          settings.format,
+          settings.quality
+        );
+      });
+
+      slices.push({
+        index: 0,
+        canvas,
+        blob,
+        previewUrl: URL.createObjectURL(blob),
+        width: totalWidth,
+        height: totalHeight,
+        startY: 0,
+      });
+
+      return {
+        totalWidth,
+        totalHeight,
+        isOverLimit: false,
+        canvas,
+        blob,
+        slices,
+      };
+    } catch (singleErr) {
+      // 만약 브라우저 메모리/VRAM 부족으로 단일 캔버스 Blob 생성이 실패하면 슬라이스 모드로 자동 폴백
+      console.warn('단일 캔버스 생성 실패로 자동 슬라이스 분할 모드로 전환합니다:', singleErr);
+      const numSlices = Math.ceil(totalHeight / effectiveChunkSize);
+      for (let i = 0; i < numSlices; i++) {
+        const startY = i * effectiveChunkSize;
+        const sliceH = Math.min(effectiveChunkSize, totalHeight - startY);
+        const s = await renderVerticalSlice(startY, sliceH, i);
+        slices.push(s);
+      }
+
+      return {
+        totalWidth,
+        totalHeight,
+        isOverLimit: true,
+        canvas: null,
+        blob: null,
+        slices,
+      };
+    }
+  }
 };
 
 export const sliceAndZipImages = async (
-  sourceCanvas: HTMLCanvasElement,
-  sliceHeight: number,
-  format: string = 'image/jpeg',
-  quality: number = 0.92,
+  source: HTMLCanvasElement | StitchSlice[],
+  sliceHeightOrFormat?: number | string,
+  formatOrQuality?: string | number,
+  qualityOrPrefix?: number | string,
   filenamePrefix: string = 'detail_slice'
 ): Promise<Blob> => {
   const zip = new JSZip();
+
+  // 1. StitchSlice[] 배열이 전달된 경우 (초고속 즉시 ZIP 생성)
+  if (Array.isArray(source)) {
+    const fmt = typeof sliceHeightOrFormat === 'string' ? sliceHeightOrFormat : 'image/jpeg';
+    const prefix = typeof formatOrQuality === 'string' ? formatOrQuality : filenamePrefix;
+    const ext = fmt === 'image/webp' ? 'webp' : fmt === 'image/png' ? 'png' : 'jpg';
+
+    for (let i = 0; i < source.length; i++) {
+      const s = source[i];
+      const indexStr = String(i + 1).padStart(2, '0');
+      zip.file(`${prefix}_${indexStr}.${ext}`, s.blob);
+    }
+
+    return await zip.generateAsync({ type: 'blob' });
+  }
+
+  // 2. 단일 HTMLCanvasElement가 전달된 경우
+  const sourceCanvas = source;
+  const sliceHeight = typeof sliceHeightOrFormat === 'number' ? sliceHeightOrFormat : 10000;
+  const format = typeof formatOrQuality === 'string' ? formatOrQuality : 'image/jpeg';
+  const quality = typeof qualityOrPrefix === 'number' ? qualityOrPrefix : 0.92;
+  const ext = format === 'image/webp' ? 'webp' : format === 'image/png' ? 'png' : 'jpg';
+
   const totalH = sourceCanvas.height;
   const totalW = sourceCanvas.width;
   const numSlices = Math.ceil(totalH / sliceHeight);
-
-  const ext = format === 'image/webp' ? 'webp' : format === 'image/png' ? 'png' : 'jpg';
 
   for (let i = 0; i < numSlices; i++) {
     const currentSliceHeight = Math.min(sliceHeight, totalH - i * sliceHeight);
@@ -134,11 +321,9 @@ export const sliceAndZipImages = async (
 
     if (!sliceCtx) continue;
 
-    // 배경색 채우기
     sliceCtx.fillStyle = '#ffffff';
     sliceCtx.fillRect(0, 0, totalW, currentSliceHeight);
 
-    // 원본에서 슬라이스 부분 복사
     sliceCtx.drawImage(
       sourceCanvas,
       0,
