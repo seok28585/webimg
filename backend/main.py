@@ -37,10 +37,12 @@ class ExtractResponse(BaseModel):
     images: List[ImageItem]
 
 @app.get("/api/health")
+@app.get("/health")
 def health_check():
     return {"status": "ok", "service": "Image Master Pro Backend", "version": "2.0.0"}
 
 @app.post("/api/extract-images", response_model=ExtractResponse)
+@app.post("/extract-images", response_model=ExtractResponse)
 def extract_images(payload: ExtractRequest):
     html = payload.html or ""
     base_url = payload.base_url or ""
@@ -51,11 +53,11 @@ def extract_images(payload: ExtractRequest):
 
     # 1. img 태그 파싱
     for idx, img in enumerate(soup.find_all("img")):
-        src = img.get("src") or img.get("data-src") or img.get("data-original")
+        src = img.get("src") or img.get("data-src") or img.get("data-original") or img.get("data-lazy-src")
         if not src:
             continue
         
-        src = src.strip()
+        src = src.strip().strip("'\"")
         # protocol-relative url 처리 (//example.com/a.jpg)
         if src.startswith("//"):
             src = "https:" + src
@@ -70,7 +72,7 @@ def extract_images(payload: ExtractRequest):
 
     # 2. 만약 img 태그가 없거나 regex로 일반 텍스트 내 이미지 링크도 보완 추출
     if not found_urls:
-        regex = r'(https?:\/\/[^\s"\'<>]+?\.(?:png|jpg|jpeg|webp|gif|bmp)(?:\?[^\s"\'<>]*)?)'
+        regex = r'(https?:\/\/[^\s"\'<>]+?\.(?:png|jpe?g|webp|gif|bmp|svg)(?:\?[^\s"\'<>]*)?)'
         matches = re.findall(regex, html, re.IGNORECASE)
         for m in matches:
             if m not in seen:
@@ -80,6 +82,7 @@ def extract_images(payload: ExtractRequest):
     return ExtractResponse(success=True, count=len(found_urls), images=found_urls)
 
 @app.get("/api/proxy-image")
+@app.get("/proxy-image")
 async def proxy_image(url: str = Query(..., description="CORS 우회를 위한 대상 이미지 URL")):
     if not url.startswith("http://") and not url.startswith("https://"):
         raise HTTPException(status_code=400, detail="유효한 HTTP/HTTPS URL이어야 합니다.")

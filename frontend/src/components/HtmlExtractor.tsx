@@ -7,9 +7,18 @@ import {
   ArrowRight,
   AlertCircle,
   ExternalLink,
-  Layers
+  Layers,
+  Download,
+  Copy,
+  Check,
+  Loader2,
 } from 'lucide-react';
 import type { ExtractedImageItem, UploadedImage } from '../types';
+import {
+  extractImagesFromHtml,
+  fetchImageBlob,
+  downloadExtractedImagesZip,
+} from '../utils/imageUtils';
 
 interface HtmlExtractorProps {
   onNotify: (msg: string) => void;
@@ -22,8 +31,12 @@ export const HtmlExtractor: React.FC<HtmlExtractorProps> = ({ onNotify, onSendTo
   const [images, setImages] = useState<ExtractedImageItem[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [failedThumbnails, setFailedThumbnails] = useState<Set<number>>(new Set());
+  const [isZipping, setIsZipping] = useState<boolean>(false);
+  const [zipProgress, setZipProgress] = useState<string>('');
+  const [copied, setCopied] = useState<boolean>(false);
 
-  // Extract from HTML API
+  // Extract images from HTML
   const handleExtract = async () => {
     if (!htmlInput.trim()) {
       setErrorMsg('HTML 코드를 입력해 주세요.');
@@ -32,38 +45,50 @@ export const HtmlExtractor: React.FC<HtmlExtractorProps> = ({ onNotify, onSendTo
 
     setIsLoading(true);
     setErrorMsg(null);
+    setFailedThumbnails(new Set());
 
     try {
-      const res = await fetch('/api/extract-images', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          html: htmlInput,
-          base_url: baseUrl.trim() || undefined,
-        }),
-      });
+      // 1. 브라우저 내장 파서를 통해 클라이언트 사이드 즉시 추출 (서버 구동 여부와 무관하게 100% 동작)
+      let extracted = extractImagesFromHtml(htmlInput, baseUrl.trim() || undefined);
 
-      if (!res.ok) {
-        throw new Error('서버 응답 오류');
+      // 2. 만약 클라이언트에서 0개가 나온 경우, 백엔드 API(BeautifulSoup) 보완 시도
+      if (extracted.length === 0) {
+        try {
+          const res = await fetch('/api/extract-images', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              html: htmlInput,
+              base_url: baseUrl.trim() || undefined,
+            }),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (data.images && data.images.length > 0) {
+              extracted = data.images;
+            }
+          }
+        } catch {
+          // 백엔드 미구동 시 무시
+        }
       }
 
-      const data = await res.json();
-      if (data.images && data.images.length > 0) {
+      if (extracted.length > 0) {
         setImages(
-          data.images.map((item: any) => ({
+          extracted.map((item) => ({
             id: item.id,
             url: item.url,
             alt: item.alt || '',
             selected: true,
           }))
         );
-        onNotify(`${data.images.length}개의 이미지를 성공적으로 추출했습니다!`);
+        onNotify(`${extracted.length}개의 이미지를 성공적으로 추출했습니다!`);
       } else {
-        setErrorMsg('입력한 HTML에서 이미지(<img>)를 찾을 수 없습니다.');
+        setErrorMsg('입력한 HTML에서 이미지 태그(<img>) 또는 이미지 링크를 찾을 수 없습니다.');
       }
     } catch (err: any) {
       console.error(err);
-      setErrorMsg('이미지 추출 중 오류가 발생했습니다. 백엔드 서버 상태를 확인해 주세요.');
+      setErrorMsg('이미지 추출 처리 중 오류가 발생했습니다. 입력값을 확인해 주세요.');
     } finally {
       setIsLoading(false);
     }
@@ -89,53 +114,98 @@ export const HtmlExtractor: React.FC<HtmlExtractorProps> = ({ onNotify, onSendTo
     }
 
     setIsLoading(true);
-    onNotify('선택된 이미지들을 다운로드하여 병합기로 변환 중입니다...');
+    onNotify(`선택된 ${selected.length}장의 이미지를 병합기로 변환 중입니다...`);
 
     try {
       const converted: UploadedImage[] = [];
 
       for (let i = 0; i < selected.length; i++) {
         const item = selected[i];
-        // CORS 프록시를 통해 다운로드
-        const proxyUrl = item.url.startsWith('data:')
-          ? item.url
-          : `/api/proxy-image?url=${encodeURIComponent(item.url)}`;
+        onNotify(`이미지 다운로드 및 변환 중 (${i + 1}/${selected.length})...`);
 
-        const response = await fetch(proxyUrl);
-        if (!response.ok) continue;
+        try {
+          const blob = await fetchImageBlob(item.url);
+          const file = new File([blob], `extracted_${i + 1}.jpg`, { type: blob.type || 'image/jpeg' });
+          const previewUrl = URL.createObjectURL(blob);
 
-        const blob = await response.blob();
-        const file = new File([blob], `extracted_${i + 1}.jpg`, { type: blob.type || 'image/jpeg' });
-        const previewUrl = URL.createObjectURL(blob);
+          const imgEl = new Image();
+          await new Promise((resolve) => {
+            imgEl.onload = resolve;
+            imgEl.onerror = resolve;
+            imgEl.src = previewUrl;
+          });
 
-        const imgEl = new Image();
-        await new Promise((resolve) => {
-          imgEl.onload = resolve;
-          imgEl.onerror = resolve;
-          imgEl.src = previewUrl;
-        });
-
-        converted.push({
-          id: Math.random().toString(36).substring(2, 9),
-          name: `추출이미지_${i + 1}`,
-          file,
-          previewUrl,
-          width: imgEl.naturalWidth || 800,
-          height: imgEl.naturalHeight || 800,
-        });
+          converted.push({
+            id: Math.random().toString(36).substring(2, 9),
+            name: `추출이미지_${i + 1}`,
+            file,
+            previewUrl,
+            width: imgEl.naturalWidth || 800,
+            height: imgEl.naturalHeight || 800,
+          });
+        } catch (e) {
+          console.warn(`이미지 다운로드 실패 (${item.url}):`, e);
+        }
       }
 
       if (converted.length > 0) {
         onSendToStitcher(converted);
         onNotify(`${converted.length}개 이미지가 병합기로 전송되었습니다!`);
       } else {
-        alert('이미지를 다운로드하지 못했습니다. 원본 URL을 확인해 주세요.');
+        alert('이미지를 다운로드하지 못했습니다. 이미지 원본 주소를 확인해 주세요.');
       }
     } catch (err: any) {
       alert(`이미지 변환 중 오류: ${err.message}`);
     } finally {
       setIsLoading(false);
     }
+  };
+
+  // Batch download selected images as ZIP
+  const handleDownloadZip = async () => {
+    const selected = images.filter((img) => img.selected);
+    if (selected.length === 0) {
+      alert('다운로드할 이미지를 선택해 주세요.');
+      return;
+    }
+
+    setIsZipping(true);
+    setZipProgress('다운로드 준비 중...');
+
+    try {
+      const zipBlob = await downloadExtractedImagesZip(selected, (current, total) => {
+        setZipProgress(`${current} / ${total}장 처리 중...`);
+      });
+
+      const url = URL.createObjectURL(zipBlob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `extracted_images_${Date.now()}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      onNotify(`${selected.length}장의 이미지가 압축 파일(ZIP)로 다운로드되었습니다!`);
+    } catch (err: any) {
+      alert(`압축 다운로드 실패: ${err.message}`);
+    } finally {
+      setIsZipping(false);
+      setZipProgress('');
+    }
+  };
+
+  // Copy selected image URLs
+  const handleCopyUrls = () => {
+    const selected = images.filter((img) => img.selected);
+    if (selected.length === 0) {
+      alert('복사할 이미지를 선택해 주세요.');
+      return;
+    }
+    const urlText = selected.map((img) => img.url).join('\n');
+    navigator.clipboard.writeText(urlText);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2500);
+    onNotify(`${selected.length}개의 이미지 URL이 클립보드에 복사되었습니다!`);
   };
 
   const selectedCount = images.filter((img) => img.selected).length;
@@ -152,9 +222,7 @@ export const HtmlExtractor: React.FC<HtmlExtractorProps> = ({ onNotify, onSendTo
         </div>
 
         <div className="form-group">
-          <label className="form-label">
-            상세설명 HTML 코드 붙여넣기
-          </label>
+          <label className="form-label">상세설명 HTML 코드 붙여넣기</label>
           <textarea
             className="form-textarea"
             rows={10}
@@ -205,7 +273,10 @@ export const HtmlExtractor: React.FC<HtmlExtractorProps> = ({ onNotify, onSendTo
           id="btn-run-extract"
         >
           {isLoading ? (
-            '이미지 태그 분석 중...'
+            <>
+              <Loader2 size={18} className="animate-spin" />
+              이미지 태그 분석 중...
+            </>
           ) : (
             <>
               <Search size={18} />
@@ -223,7 +294,7 @@ export const HtmlExtractor: React.FC<HtmlExtractorProps> = ({ onNotify, onSendTo
             추출된 이미지 목록 ({selectedCount}/{images.length}장 선택됨)
           </h2>
           {images.length > 0 && (
-            <div style={{ display: 'flex', gap: '8px' }}>
+            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
               <button
                 className="btn btn-sm btn-secondary"
                 onClick={() => toggleSelectAll(true)}
@@ -235,6 +306,14 @@ export const HtmlExtractor: React.FC<HtmlExtractorProps> = ({ onNotify, onSendTo
                 onClick={() => toggleSelectAll(false)}
               >
                 <Square size={14} /> 선택 해제
+              </button>
+              <button
+                className="btn btn-sm btn-secondary"
+                onClick={handleCopyUrls}
+                title="선택된 이미지 URL 목록 복사"
+              >
+                {copied ? <Check size={14} color="var(--success)" /> : <Copy size={14} />}
+                {copied ? '복사 완료' : 'URL 복사'}
               </button>
             </div>
           )}
@@ -253,9 +332,12 @@ export const HtmlExtractor: React.FC<HtmlExtractorProps> = ({ onNotify, onSendTo
               }}
             >
               {images.map((img) => {
-                const proxySrc = img.url.startsWith('data:')
-                  ? img.url
-                  : `/api/proxy-image?url=${encodeURIComponent(img.url)}`;
+                // 1차는 원본 URL 직접 렌더링(no-referrer 정책으로 핫링크 방지 우회 및 즉각 로딩)
+                // 직접 로딩 실패 시 프록시 URL로 폴백
+                const isFailed = failedThumbnails.has(img.id);
+                const displaySrc = isFailed
+                  ? `/api/proxy-image?url=${encodeURIComponent(img.url)}`
+                  : img.url;
 
                 return (
                   <div
@@ -276,10 +358,16 @@ export const HtmlExtractor: React.FC<HtmlExtractorProps> = ({ onNotify, onSendTo
                     }}
                   >
                     <img
-                      src={proxySrc}
+                      src={displaySrc}
                       alt={img.alt}
+                      referrerPolicy="no-referrer"
                       style={{ width: '100%', height: '100%', objectFit: 'cover' }}
                       loading="lazy"
+                      onError={() => {
+                        if (!failedThumbnails.has(img.id)) {
+                          setFailedThumbnails((prev) => new Set(prev).add(img.id));
+                        }
+                      }}
                     />
                     <div
                       style={{
@@ -335,13 +423,43 @@ export const HtmlExtractor: React.FC<HtmlExtractorProps> = ({ onNotify, onSendTo
             >
               <button
                 className="btn btn-primary btn-lg"
-                style={{ flex: 1 }}
+                style={{ flex: 2, minWidth: '220px' }}
                 onClick={handleExportToStitcher}
-                disabled={selectedCount === 0 || isLoading}
+                disabled={selectedCount === 0 || isLoading || isZipping}
                 id="btn-export-to-stitcher"
               >
-                <ArrowRight size={18} />
-                선택한 {selectedCount}장 상세페이지 병합기로 전송
+                {isLoading ? (
+                  <>
+                    <Loader2 size={18} className="animate-spin" />
+                    변환 처리 중...
+                  </>
+                ) : (
+                  <>
+                    <ArrowRight size={18} />
+                    선택한 {selectedCount}장 상세페이지 병합기로 전송
+                  </>
+                )}
+              </button>
+
+              <button
+                className="btn btn-secondary btn-lg"
+                style={{ flex: 1, minWidth: '180px' }}
+                onClick={handleDownloadZip}
+                disabled={selectedCount === 0 || isLoading || isZipping}
+                id="btn-download-zip"
+                title="선택한 이미지들을 ZIP 압축 파일로 다운로드"
+              >
+                {isZipping ? (
+                  <>
+                    <Loader2 size={18} className="animate-spin" />
+                    {zipProgress || '압축 중...'}
+                  </>
+                ) : (
+                  <>
+                    <Download size={18} />
+                    선택 이미지 ZIP 다운로드
+                  </>
+                )}
               </button>
             </div>
           </div>

@@ -299,3 +299,270 @@ export const formatBytes = (bytes: number, decimals: number = 1): string => {
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 };
+
+/**
+ * HTML 문자열에서 이미지 URL들을 순수 브라우저(클라이언트) 환경에서 추출합니다.
+ * 백엔드 서버가 구동되지 않아도 100% 정상 작동합니다.
+ */
+export const extractImagesFromHtml = (
+  html: string,
+  baseUrl?: string
+): { id: number; url: string; alt: string }[] => {
+  if (!html || !html.trim()) return [];
+
+  const foundUrls: { id: number; url: string; alt: string }[] = [];
+  const seen = new Set<string>();
+
+  const resolveUrl = (src: string): string => {
+    let clean = src.trim();
+    if (!clean) return '';
+    // 따옴표 및 이스케이프 제거
+    clean = clean.replace(/^['"]|['"]$/g, '');
+
+    // 프로토콜 상대 경로 (//example.com/img.jpg)
+    if (clean.startsWith('//')) {
+      return 'https:' + clean;
+    }
+
+    // data URL은 그대로 반환
+    if (clean.startsWith('data:image/')) {
+      return clean;
+    }
+
+    // 상대 경로 처리
+    if (baseUrl && !/^https?:\/\//i.test(clean)) {
+      try {
+        const base = baseUrl.startsWith('http') ? baseUrl : `https://${baseUrl}`;
+        return new URL(clean, base).href;
+      } catch {
+        return clean;
+      }
+    }
+
+    return clean;
+  };
+
+  const addUrl = (rawUrl: string, altText?: string) => {
+    const url = resolveUrl(rawUrl);
+    if (!url) return;
+
+    const isValid =
+      url.startsWith('http://') ||
+      url.startsWith('https://') ||
+      url.startsWith('data:image/');
+
+    if (isValid && !seen.has(url)) {
+      seen.add(url);
+      const alt = altText && altText.trim() ? altText.trim() : `이미지 ${foundUrls.length + 1}`;
+      foundUrls.push({ id: foundUrls.length + 1, url, alt });
+    }
+  };
+
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+
+    // <base href="..."> 태그 확인
+    const baseEl = doc.querySelector('base');
+    const detectedBase = baseEl?.getAttribute('href') || baseUrl;
+    if (detectedBase && !baseUrl) {
+      baseUrl = detectedBase;
+    }
+
+    // 1. <img> 태그 파싱 (src, data-src, data-original, data-lazy-src 등 다양한 지연로딩 속성 지원)
+    const imgEls = doc.querySelectorAll('img');
+    imgEls.forEach((img) => {
+      const src =
+        img.getAttribute('src') ||
+        img.getAttribute('data-src') ||
+        img.getAttribute('data-original') ||
+        img.getAttribute('data-lazy-src') ||
+        img.getAttribute('data-url') ||
+        img.getAttribute('data-origin') ||
+        '';
+
+      if (src) {
+        addUrl(src, img.getAttribute('alt') || '');
+      }
+
+      // srcset 속성도 파싱
+      const srcset = img.getAttribute('srcset');
+      if (srcset) {
+        srcset.split(',').forEach((item) => {
+          const itemUrl = item.trim().split(/\s+/)[0];
+          if (itemUrl) addUrl(itemUrl, img.getAttribute('alt') || '');
+        });
+      }
+    });
+
+    // 2. <picture> 내 <source> 태그 파싱
+    const sourceEls = doc.querySelectorAll('source');
+    sourceEls.forEach((source) => {
+      const srcset = source.getAttribute('srcset') || source.getAttribute('src');
+      if (srcset) {
+        srcset.split(',').forEach((item) => {
+          const itemUrl = item.trim().split(/\s+/)[0];
+          if (itemUrl) addUrl(itemUrl);
+        });
+      }
+    });
+
+    // 3. 인라인 스타일의 background-image 파싱
+    const styledEls = doc.querySelectorAll('[style*="background"]');
+    styledEls.forEach((el) => {
+      const style = el.getAttribute('style') || '';
+      const bgMatches = style.matchAll(/url\(['"]?([^'"\)]+)['"]?\)/gi);
+      for (const m of bgMatches) {
+        if (m[1]) addUrl(m[1]);
+      }
+    });
+
+    // 4. 이미지 확장자로 끝나는 <a> 태그 링크 파싱
+    const linkEls = doc.querySelectorAll('a[href]');
+    linkEls.forEach((a) => {
+      const href = a.getAttribute('href') || '';
+      if (/\.(png|jpe?g|webp|gif|bmp|svg)(\?[^\s"'<>]*)?$/i.test(href)) {
+        addUrl(href, a.textContent || '');
+      }
+    });
+  } catch (e) {
+    console.warn('DOMParser failed, will fallback to regex:', e);
+  }
+
+  // 5. 정규표현식 보완 추출 (태그가 깨졌거나 텍스트 내에 URL이 직접 포함된 경우)
+  if (foundUrls.length === 0) {
+    const regex = /(https?:\/\/[^\s"'<>]+?\.(?:png|jpe?g|webp|gif|bmp|svg)(?:\?[^\s"'<>]*)?)/gi;
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(html)) !== null) {
+      if (match[1]) {
+        addUrl(match[1]);
+      }
+    }
+
+    const dataRegex = /(data:image\/[a-zA-Z+]+;base64,[^\s"'<>]+)/gi;
+    let dataMatch: RegExpExecArray | null;
+    while ((dataMatch = dataRegex.exec(html)) !== null) {
+      if (dataMatch[1]) {
+        addUrl(dataMatch[1]);
+      }
+    }
+  }
+
+  return foundUrls;
+};
+
+/**
+ * CORS 및 핫링크 방지를 우회하여 이미지를 Blob으로 안전하게 다운로드합니다.
+ * 백엔드 프록시 -> 브라우저 직접 fetch -> 공용 프록시 -> 캔버스 추출 단계로 다단계 폴백합니다.
+ */
+export const fetchImageBlob = async (url: string): Promise<Blob> => {
+  if (url.startsWith('data:')) {
+    const res = await fetch(url);
+    return await res.blob();
+  }
+
+  // 1차 시도: 로컬/Vercel 백엔드 프록시
+  try {
+    const proxyUrl = `/api/proxy-image?url=${encodeURIComponent(url)}`;
+    const res = await fetch(proxyUrl, { signal: AbortSignal.timeout(6000) });
+    if (res.ok) {
+      const blob = await res.blob();
+      if (blob.size > 0 && blob.type.startsWith('image/')) {
+        return blob;
+      }
+    }
+  } catch {
+    // 백엔드 미실행 시 2차 시도로 계속 진행
+  }
+
+  // 2차 시도: no-referrer & cors 직접 fetch
+  try {
+    const res = await fetch(url, {
+      referrerPolicy: 'no-referrer',
+      mode: 'cors',
+      signal: AbortSignal.timeout(6000),
+    });
+    if (res.ok) {
+      const blob = await res.blob();
+      if (blob.size > 0) return blob;
+    }
+  } catch {
+    // CORS 차단 시 3차 시도로 계속 진행
+  }
+
+  // 3차 시도: 공용 고속 이미지 프록시 (images.weserv.nl)
+  try {
+    const weservUrl = `https://images.weserv.nl/?url=${encodeURIComponent(url)}&default=${encodeURIComponent(url)}`;
+    const res = await fetch(weservUrl, { signal: AbortSignal.timeout(10000) });
+    if (res.ok) {
+      const blob = await res.blob();
+      if (blob.size > 0 && blob.type.startsWith('image/')) return blob;
+    }
+  } catch {
+    // 다음 시도로 계속 진행
+  }
+
+  // 4차 시도: 공용 CORS 프록시 (allorigins.win)
+  try {
+    const alloriginsUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
+    const res = await fetch(alloriginsUrl, { signal: AbortSignal.timeout(10000) });
+    if (res.ok) {
+      const blob = await res.blob();
+      if (blob.size > 0) return blob;
+    }
+  } catch {
+    // 다음 시도로 계속 진행
+  }
+
+  // 5차 시도: Image 엘리먼트와 캔버스를 통한 픽셀 데이터 Blob 변환
+  return await new Promise<Blob>((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.referrerPolicy = 'no-referrer';
+    img.onload = () => {
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.naturalWidth || 800;
+        canvas.height = img.naturalHeight || 800;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error('Canvas Context 생성 실패');
+        ctx.drawImage(img, 0, 0);
+        canvas.toBlob((blob) => {
+          if (blob) resolve(blob);
+          else reject(new Error('Canvas toBlob 생성 실패'));
+        }, 'image/jpeg', 0.95);
+      } catch (err) {
+        reject(err);
+      }
+    };
+    img.onerror = () => reject(new Error(`이미지 로드 실패: ${url}`));
+    img.src = url;
+  });
+};
+
+/**
+ * 추출된 이미지들을 ZIP 파일로 압축하여 일괄 다운로드 생성
+ */
+export const downloadExtractedImagesZip = async (
+  images: { id: number; url: string; alt?: string }[],
+  onProgress?: (current: number, total: number) => void
+): Promise<Blob> => {
+  const zip = new JSZip();
+
+  for (let i = 0; i < images.length; i++) {
+    const item = images[i];
+    if (onProgress) onProgress(i + 1, images.length);
+
+    try {
+      const blob = await fetchImageBlob(item.url);
+      const ext = blob.type === 'image/png' ? 'png' : blob.type === 'image/webp' ? 'webp' : 'jpg';
+      const filename = `image_${String(i + 1).padStart(3, '0')}.${ext}`;
+      zip.file(filename, blob);
+    } catch (e) {
+      console.warn(`이미지 다운로드 실패 (#${item.id}):`, e);
+    }
+  }
+
+  return await zip.generateAsync({ type: 'blob' });
+};
+
