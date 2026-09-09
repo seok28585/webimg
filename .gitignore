@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+__pycache__/
+backend/__pycache__/
+*.pyc
+
+# Builds
+dist/
+frontend/dist/
+.vercel
+
+# Logs & OS
+*.log
+.DS_Store
+Thumbs.db
