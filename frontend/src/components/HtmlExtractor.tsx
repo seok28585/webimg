@@ -118,6 +118,7 @@ export const HtmlExtractor: React.FC<HtmlExtractorProps> = ({ onNotify, onSendTo
 
     try {
       const converted: UploadedImage[] = [];
+      const failedItems: { id: number; error: string }[] = [];
 
       for (let i = 0; i < selected.length; i++) {
         const item = selected[i];
@@ -125,34 +126,44 @@ export const HtmlExtractor: React.FC<HtmlExtractorProps> = ({ onNotify, onSendTo
 
         try {
           const blob = await fetchImageBlob(item.url);
-          const file = new File([blob], `extracted_${i + 1}.jpg`, { type: blob.type || 'image/jpeg' });
+          const ext = blob.type.includes('png') ? 'png' : blob.type.includes('webp') ? 'webp' : 'jpg';
+          const file = new File([blob], `extracted_${item.id}.${ext}`, { type: blob.type || 'image/jpeg' });
           const previewUrl = URL.createObjectURL(blob);
 
           const imgEl = new Image();
-          await new Promise((resolve) => {
-            imgEl.onload = resolve;
-            imgEl.onerror = resolve;
+          await new Promise<void>((resolve, reject) => {
+            imgEl.onload = () => resolve();
+            imgEl.onerror = () => reject(new Error('미리보기 엘리먼트 생성 실패'));
             imgEl.src = previewUrl;
           });
 
           converted.push({
             id: Math.random().toString(36).substring(2, 9),
-            name: `추출이미지_${i + 1}`,
+            name: `추출이미지_${item.id}`,
             file,
             previewUrl,
             width: imgEl.naturalWidth || 800,
             height: imgEl.naturalHeight || 800,
           });
-        } catch (e) {
-          console.warn(`이미지 다운로드 실패 (${item.url}):`, e);
+        } catch (e: any) {
+          console.warn(`이미지 다운로드 실패 (#${item.id}):`, e);
+          failedItems.push({ id: item.id, error: e.message || '다운로드 실패' });
         }
       }
 
       if (converted.length > 0) {
         onSendToStitcher(converted);
-        onNotify(`${converted.length}개 이미지가 병합기로 전송되었습니다!`);
+        if (failedItems.length > 0) {
+          onNotify(
+            `${converted.length}개 이미지가 병합기로 전송되었습니다. (${failedItems.length}개 실패: #${failedItems.map((f) => f.id).join(', #')})`
+          );
+        } else {
+          onNotify(`${converted.length}개 이미지가 병합기로 성공적으로 전송되었습니다!`);
+        }
       } else {
-        alert('이미지를 다운로드하지 못했습니다. 이미지 원본 주소를 확인해 주세요.');
+        alert(
+          `선택한 이미지를 다운로드하지 못했습니다.\n원인: 대상 쇼핑몰 서버에서 외부 접근을 제한하고 있습니다. 네트워크 상태를 확인해 주세요.`
+        );
       }
     } catch (err: any) {
       alert(`이미지 변환 중 오류: ${err.message}`);

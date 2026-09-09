@@ -3,8 +3,16 @@
   "outputDirectory": "frontend/dist",
   "rewrites": [
     {
+      "source": "/api/proxy-image",
+      "destination": "/api/proxy-image.js"
+    },
+    {
       "source": "/api/(.*)",
       "destination": "/api/index.py"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
     }
   ]
 }

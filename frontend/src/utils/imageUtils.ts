@@ -461,18 +461,22 @@ export const fetchImageBlob = async (url: string): Promise<Blob> => {
     return await res.blob();
   }
 
-  // 1차 시도: 로컬/Vercel 백엔드 프록시
+  // 1차 시도: /api/proxy-image (Vite Dev Server 플러그인 또는 Vercel Serverless Function)
   try {
     const proxyUrl = `/api/proxy-image?url=${encodeURIComponent(url)}`;
-    const res = await fetch(proxyUrl, { signal: AbortSignal.timeout(6000) });
+    const res = await fetch(proxyUrl, { signal: AbortSignal.timeout(25000) });
     if (res.ok) {
       const blob = await res.blob();
-      if (blob.size > 0 && blob.type.startsWith('image/')) {
+      if (blob.size > 0) {
+        // MIME type 보정
+        if (!blob.type || blob.type === 'application/octet-stream') {
+          return new Blob([blob], { type: 'image/jpeg' });
+        }
         return blob;
       }
     }
-  } catch {
-    // 백엔드 미실행 시 2차 시도로 계속 진행
+  } catch (e) {
+    console.warn('1차 프록시 시도 실패, 직접 fetch 시도:', e);
   }
 
   // 2차 시도: no-referrer & cors 직접 fetch
@@ -480,23 +484,23 @@ export const fetchImageBlob = async (url: string): Promise<Blob> => {
     const res = await fetch(url, {
       referrerPolicy: 'no-referrer',
       mode: 'cors',
-      signal: AbortSignal.timeout(6000),
+      signal: AbortSignal.timeout(20000),
     });
     if (res.ok) {
       const blob = await res.blob();
       if (blob.size > 0) return blob;
     }
   } catch {
-    // CORS 차단 시 3차 시도로 계속 진행
+    // CORS 차단 시 다음 단계로 계속 진행
   }
 
   // 3차 시도: 공용 고속 이미지 프록시 (images.weserv.nl)
   try {
     const weservUrl = `https://images.weserv.nl/?url=${encodeURIComponent(url)}&default=${encodeURIComponent(url)}`;
-    const res = await fetch(weservUrl, { signal: AbortSignal.timeout(10000) });
+    const res = await fetch(weservUrl, { signal: AbortSignal.timeout(20000) });
     if (res.ok) {
       const blob = await res.blob();
-      if (blob.size > 0 && blob.type.startsWith('image/')) return blob;
+      if (blob.size > 0) return blob;
     }
   } catch {
     // 다음 시도로 계속 진행
@@ -505,7 +509,7 @@ export const fetchImageBlob = async (url: string): Promise<Blob> => {
   // 4차 시도: 공용 CORS 프록시 (allorigins.win)
   try {
     const alloriginsUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
-    const res = await fetch(alloriginsUrl, { signal: AbortSignal.timeout(10000) });
+    const res = await fetch(alloriginsUrl, { signal: AbortSignal.timeout(20000) });
     if (res.ok) {
       const blob = await res.blob();
       if (blob.size > 0) return blob;

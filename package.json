@@ -2,6 +2,7 @@
   "name": "gaul-image-master-pro",
   "version": "2.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "npm --prefix frontend run dev",
     "build": "npm --prefix frontend install && npm --prefix frontend run build",
